@@ -70,7 +70,8 @@ from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.helpers import dummy_context
-
+from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
+from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
 
 class SequentialLRNoEpoch(SequentialLR):
     def step(self, epoch=None):
@@ -89,6 +90,138 @@ class nnUNetTrainerDA5_Ranger_CosAnneal(nnUNetTrainer):
     ):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.initial_lr = 1e-3
+
+    def configure_optimizers(self):
+        optimizer = Ranger(self.network.parameters(), lr=self.initial_lr)
+
+        # Total number of training epochs
+        total_epochs = self.num_epochs
+
+        # Define the flat (constant) phase as 70% of total epochs
+        flat_epochs = int(total_epochs * 0.7)
+        # The cosine annealing phase covers the remaining 30% of epochs
+        cosine_epochs = total_epochs - flat_epochs
+
+        # Scheduler for constant learning rate during the flat phase
+        scheduler_flat = ConstantLR(optimizer, factor=1.0, total_iters=flat_epochs)
+
+        # Cosine annealing scheduler: decays from base_lr (0.001) to eta_min (here set to 0)
+        scheduler_cosine = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=0)
+
+        # Chain the two schedulers: use flat phase first, then cosine annealing starting at flat_epochs
+        lr_scheduler = SequentialLRNoEpoch(
+            optimizer,
+            schedulers=[scheduler_flat, scheduler_cosine],
+            milestones=[flat_epochs],
+        )
+
+        # lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
+
+        return optimizer, lr_scheduler
+
+    def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
+        patch_size = self.configuration_manager.patch_size
+        dim = len(patch_size)
+        # todo rotation should be defined dynamically based on patch size (more isotropic patch sizes = more rotation)
+        if dim == 2:
+            do_dummy_2d_data_aug = False
+            # todo revisit this parametrization
+            if max(patch_size) / min(patch_size) > 1.5:
+                rotation_for_DA = (-15.0 / 360 * 2.0 * np.pi, 15.0 / 360 * 2.0 * np.pi)
+            else:
+                rotation_for_DA = (
+                    -180.0 / 360 * 2.0 * np.pi,
+                    180.0 / 360 * 2.0 * np.pi,
+                )
+            mirror_axes = (0, 1)
+        elif dim == 3:
+            # todo this is not ideal. We could also have patch_size (64, 16, 128) in which case a full 180deg 2d rot would be bad
+            # order of the axes is determined by spacing, not image size
+            do_dummy_2d_data_aug = (max(patch_size) / patch_size[0]) > ANISO_THRESHOLD
+            if do_dummy_2d_data_aug:
+                # why do we rotate 180 deg here all the time? We should also restrict it
+                rotation_for_DA = (
+                    -180.0 / 360 * 2.0 * np.pi,
+                    180.0 / 360 * 2.0 * np.pi,
+                )
+            else:
+                rotation_for_DA = (-30.0 / 360 * 2.0 * np.pi, 30.0 / 360 * 2.0 * np.pi)
+            mirror_axes = (0, 1, 2)
+        else:
+            raise RuntimeError()
+
+        # todo this function is stupid. It doesn't even use the correct scale range (we keep things as they were in the
+        #  old nnunet for now)
+        initial_patch_size = get_patch_size(
+            patch_size[-dim:],
+            rotation_for_DA,
+            rotation_for_DA,
+            rotation_for_DA,
+            (0.7, 1.43),
+        )
+        if do_dummy_2d_data_aug:
+            initial_patch_size[0] = patch_size[0]
+
+        self.print_to_log_file(f"do_dummy_2d_data_aug: {do_dummy_2d_data_aug}")
+        self.inference_allowed_mirroring_axes = mirror_axes
+
+        return rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes
+
+
+class nnUNetTrainerDA5_Ranger_CosAnneal_CEDice_800Epochs(nnUNetTrainer):
+    def __init__(
+        self,
+        plans: dict,
+        configuration: str,
+        fold: int,
+        dataset_json: dict,
+        device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.initial_lr = 1e-3
+        self.num_epochs = 800
+
+    def _build_loss(self):
+        assert not self.label_manager.has_regions, (
+            "regions not supported by this trainer"
+        )
+
+        soft_dice_kwargs = {
+            "batch_dice": self.configuration_manager.batch_dice,
+            "do_bg": self.label_manager.has_regions,
+            "smooth": 1e-5,
+            "ddp": self.is_ddp,
+        }
+
+        ce_kwargs = {
+            "weight": None,
+            "ignore_index": self.label_manager.ignore_label
+            if self.label_manager.has_ignore_label
+            else -100,
+        }
+
+        loss = DC_and_CE_loss(
+            soft_dice_kwargs,
+            ce_kwargs,
+            weight_ce=3,
+            weight_dice=1,
+            ignore_label=None,
+        )
+
+        # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
+        # this gives higher resolution outputs more weight in the loss
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array(
+                [1 / (2**i) for i in range(len(deep_supervision_scales))]
+            )
+            weights[-1] = 0
+
+            # we don't use the lowest 2 outputs. Normalize weights so that they sum to 1
+            weights = weights / weights.sum()
+            # now wrap the loss
+            loss = DeepSupervisionWrapper(loss, weights)
+        return loss
 
     def configure_optimizers(self):
         optimizer = Ranger(self.network.parameters(), lr=self.initial_lr)
