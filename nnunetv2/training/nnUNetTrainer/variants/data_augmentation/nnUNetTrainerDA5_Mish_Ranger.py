@@ -43,6 +43,7 @@ from batchgenerators.transforms.utility_transforms import (
 from batchgeneratorsv2.helpers.scalar_type import RandomScalar
 from ranger import Ranger
 from torch import autocast
+from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, SequentialLR
 
 from nnunetv2.configuration import ANISO_THRESHOLD
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import (
@@ -71,6 +72,12 @@ from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.helpers import dummy_context
 
 
+class SequentialLRNoEpoch(SequentialLR):
+    def step(self, epoch=None):
+        # Ignore the epoch argument and call the parent method without it
+        super().step()
+
+
 class nnUNetTrainerDA5_Ranger_CosAnneal(nnUNetTrainer):
     def __init__(
         self,
@@ -85,24 +92,30 @@ class nnUNetTrainerDA5_Ranger_CosAnneal(nnUNetTrainer):
 
     def configure_optimizers(self):
         optimizer = Ranger(self.network.parameters(), lr=self.initial_lr)
-        # Calculate when to start cosine annealing (after 70% of epochs)
-        cosine_start_epoch = int(0.7 * self.num_epochs)
 
-        # Create a scheduler that keeps lr constant for 70% of epochs, then applies cosine annealing
-        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        # Total number of training epochs
+        total_epochs = self.num_epochs
+
+        # Define the flat (constant) phase as 70% of total epochs
+        flat_epochs = int(total_epochs * 0.7)
+        # The cosine annealing phase covers the remaining 30% of epochs
+        cosine_epochs = total_epochs - flat_epochs
+
+        # Scheduler for constant learning rate during the flat phase
+        scheduler_flat = ConstantLR(optimizer, factor=1.0, total_iters=flat_epochs)
+
+        # Cosine annealing scheduler: decays from base_lr (0.001) to eta_min (here set to 0)
+        scheduler_cosine = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=0)
+
+        # Chain the two schedulers: use flat phase first, then cosine annealing starting at flat_epochs
+        lr_scheduler = SequentialLRNoEpoch(
             optimizer,
-            lambda epoch: 1.0
-            if epoch < cosine_start_epoch
-            else 0.5
-            * (
-                1
-                + np.cos(
-                    np.pi
-                    * (epoch - cosine_start_epoch)
-                    / (self.num_epochs - cosine_start_epoch)
-                )
-            ),
+            schedulers=[scheduler_flat, scheduler_cosine],
+            milestones=[flat_epochs],
         )
+
+        # lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
+
         return optimizer, lr_scheduler
 
     def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
@@ -170,12 +183,21 @@ class nnUNetTrainerDA5(nnUNetTrainer):
         optimizer = Ranger(self.network.parameters(), lr=self.initial_lr)
         # Calculate when to start cosine annealing (after 70% of epochs)
         cosine_start_epoch = int(0.7 * self.num_epochs)
-        
+
         # Create a scheduler that keeps lr constant for 70% of epochs, then applies cosine annealing
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
-            lambda epoch: 1.0 if epoch < cosine_start_epoch else 
-            0.5 * (1 + np.cos(np.pi * (epoch - cosine_start_epoch) / (self.num_epochs - cosine_start_epoch)))
+            lambda epoch: 1.0
+            if epoch < cosine_start_epoch
+            else 0.5
+            * (
+                1
+                + np.cos(
+                    np.pi
+                    * (epoch - cosine_start_epoch)
+                    / (self.num_epochs - cosine_start_epoch)
+                )
+            ),
         )
         return optimizer, lr_scheduler
 
