@@ -66,12 +66,13 @@ from nnunetv2.training.data_augmentation.custom_transforms.transforms_for_dummy_
     Convert3DTo2DTransform,
 )
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
+from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
+from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.helpers import dummy_context
-from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
-from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
+
 
 class SequentialLRNoEpoch(SequentialLR):
     def step(self, epoch=None):
