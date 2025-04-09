@@ -589,7 +589,7 @@ class nnUNetTrainerDA5(nnUNetTrainer):
         ):
             output = self.network(data)
             del data
-            l = self.loss(output, target)
+            lo = self.loss(output, target)
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -642,7 +642,7 @@ class nnUNetTrainerDA5(nnUNetTrainer):
             fn_hard = fn_hard[1:]
 
         return {
-            "loss": l.detach().cpu().numpy(),
+            "loss": lo.detach().cpu().numpy(),
             "tp_hard": tp_hard,
             "fp_hard": fp_hard,
             "fn_hard": fn_hard,
