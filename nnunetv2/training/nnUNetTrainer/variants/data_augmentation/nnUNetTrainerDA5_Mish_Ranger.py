@@ -41,7 +41,6 @@ from batchgenerators.transforms.utility_transforms import (
     RenameTransform,
 )
 from batchgeneratorsv2.helpers.scalar_type import RandomScalar
-from ranger import Ranger
 from torch import autocast
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, SequentialLR
 
@@ -70,6 +69,9 @@ from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+
+# from ranger import Ranger
+from nnunetv2.training.optimizer.ranger import Ranger
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.helpers import dummy_context
 
@@ -92,27 +94,56 @@ class nnUNetTrainerDA5(nnUNetTrainer):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.initial_lr = 1e-3
 
-    def configure_optimizers(self):
-        optimizer = Ranger(self.network.parameters(), lr=self.initial_lr)
-        # Calculate when to start cosine annealing (after 70% of epochs)
-        cosine_start_epoch = int(0.7 * self.num_epochs)
+    # def configure_optimizers(self):
+    #     optimizer = Ranger(
+    #         self.network.parameters(),
+    #         lr=self.initial_lr,
+    #         k=6,
+    #         N_sma_threshhold=5,
+    #         weight_decay=self.weight_decay,
+    #     )
 
-        # Create a scheduler that keeps lr constant for 70% of epochs, then applies cosine annealing
-        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lambda epoch: 1.0
-            if epoch < cosine_start_epoch
-            else 0.5
-            * (
-                1
-                + np.cos(
-                    np.pi
-                    * (epoch - cosine_start_epoch)
-                    / (self.num_epochs - cosine_start_epoch)
-                )
-            ),
+    #     lr_scheduler = CustomCosineAnnealingLR(
+    #         optimizer, max_steps=self.num_epochs, initial_lr=self.initial_lr
+    #     )
+
+    #     return optimizer, lr_scheduler
+
+
+    def configure_optimizers(self):
+        optimizer = Ranger(
+            self.network.parameters(),
+            lr=self.initial_lr,
+            k=6,
+            N_sma_threshhold=5,
+            weight_decay=self.weight_decay,
         )
+
+        # Total number of training epochs
+        total_epochs = self.num_epochs
+
+        # Define the flat (constant) phase as 70% of total epochs
+        flat_epochs = int(total_epochs * 0.7)
+        # The cosine annealing phase covers the remaining 30% of epochs
+        cosine_epochs = total_epochs - flat_epochs
+
+        # Scheduler for constant learning rate during the flat phase
+        scheduler_flat = ConstantLR(optimizer, factor=1.0, total_iters=flat_epochs)
+
+        # Cosine annealing scheduler: decays from base_lr (0.001) to eta_min (here set to 0)
+        scheduler_cosine = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=0)
+
+        # Chain the two schedulers: use flat phase first, then cosine annealing starting at flat_epochs
+        lr_scheduler = SequentialLRNoEpoch(
+            optimizer,
+            schedulers=[scheduler_flat, scheduler_cosine],
+            milestones=[flat_epochs],
+        )
+
+        # lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
+
         return optimizer, lr_scheduler
+
 
     def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
         patch_size = self.configuration_manager.patch_size
@@ -1216,56 +1247,7 @@ class nnUNetTrainerDA5_10epochs(nnUNetTrainerDA5):
         self.num_epochs = 10
 
 
-class nnUNetTrainerDA5_Ranger_CosAnneal(nnUNetTrainerDA5):
-    def __init__(
-        self,
-        plans: dict,
-        configuration: str,
-        fold: int,
-        dataset_json: dict,
-        device: torch.device = torch.device("cuda"),
-    ):
-        super().__init__(plans, configuration, fold, dataset_json, device)
-        self.initial_lr = 1e-3
-
-    def configure_optimizers(self):
-        optimizer = Ranger(
-            self.network.parameters(),
-            lr=self.initial_lr,
-            k=6,
-            N_sma_threshhold=5,
-            weight_decay=self.weight_decay,
-        )
-
-        # Total number of training epochs
-        total_epochs = self.num_epochs
-
-        # Define the flat (constant) phase as 70% of total epochs
-        flat_epochs = int(total_epochs * 0.7)
-        # The cosine annealing phase covers the remaining 30% of epochs
-        cosine_epochs = total_epochs - flat_epochs
-
-        # Scheduler for constant learning rate during the flat phase
-        scheduler_flat = ConstantLR(optimizer, factor=1.0, total_iters=flat_epochs)
-
-        # Cosine annealing scheduler: decays from base_lr (0.001) to eta_min (here set to 0)
-        scheduler_cosine = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=0)
-
-        # Chain the two schedulers: use flat phase first, then cosine annealing starting at flat_epochs
-        lr_scheduler = SequentialLRNoEpoch(
-            optimizer,
-            schedulers=[scheduler_flat, scheduler_cosine],
-            milestones=[flat_epochs],
-        )
-
-        # lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
-
-        return optimizer, lr_scheduler
-
-
-class nnUNetTrainerDA5_Ranger_CosAnneal_CEDice_800Epochs(
-    nnUNetTrainerDA5_Ranger_CosAnneal
-):
+class nnUNetTrainerDA5_Ranger_800Epochs(nnUNetTrainerDA5):
     def __init__(
         self,
         plans: dict,
@@ -1319,3 +1301,108 @@ class nnUNetTrainerDA5_Ranger_CosAnneal_CEDice_800Epochs(
             # now wrap the loss
             loss = DeepSupervisionWrapper(loss, weights)
         return loss
+
+
+# class nnUNetTrainerDA5_Ranger_CosAnneal(nnUNetTrainerDA5):
+#     def __init__(
+#         self,
+#         plans: dict,
+#         configuration: str,
+#         fold: int,
+#         dataset_json: dict,
+#         device: torch.device = torch.device("cuda"),
+#     ):
+#         super().__init__(plans, configuration, fold, dataset_json, device)
+#         self.initial_lr = 1e-3
+
+#     def configure_optimizers(self):
+#         optimizer = Ranger(
+#             self.network.parameters(),
+#             lr=self.initial_lr,
+#             k=6,
+#             N_sma_threshhold=5,
+#             weight_decay=self.weight_decay,
+#         )
+
+#         # Total number of training epochs
+#         total_epochs = self.num_epochs
+
+#         # Define the flat (constant) phase as 70% of total epochs
+#         flat_epochs = int(total_epochs * 0.7)
+#         # The cosine annealing phase covers the remaining 30% of epochs
+#         cosine_epochs = total_epochs - flat_epochs
+
+#         # Scheduler for constant learning rate during the flat phase
+#         scheduler_flat = ConstantLR(optimizer, factor=1.0, total_iters=flat_epochs)
+
+#         # Cosine annealing scheduler: decays from base_lr (0.001) to eta_min (here set to 0)
+#         scheduler_cosine = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=0)
+
+#         # Chain the two schedulers: use flat phase first, then cosine annealing starting at flat_epochs
+#         lr_scheduler = SequentialLRNoEpoch(
+#             optimizer,
+#             schedulers=[scheduler_flat, scheduler_cosine],
+#             milestones=[flat_epochs],
+#         )
+
+#         # lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
+
+#         return optimizer, lr_scheduler
+
+
+# class nnUNetTrainerDA5_Ranger_CosAnneal_CEDice_800Epochs(
+#     nnUNetTrainerDA5_Ranger_CosAnneal
+# ):
+#     def __init__(
+#         self,
+#         plans: dict,
+#         configuration: str,
+#         fold: int,
+#         dataset_json: dict,
+#         device: torch.device = torch.device("cuda"),
+#     ):
+#         super().__init__(plans, configuration, fold, dataset_json, device)
+#         self.initial_lr = 1e-3
+#         self.num_epochs = 800
+
+#     def _build_loss(self):
+#         assert not self.label_manager.has_regions, (
+#             "regions not supported by this trainer"
+#         )
+
+#         soft_dice_kwargs = {
+#             "batch_dice": self.configuration_manager.batch_dice,
+#             "do_bg": self.label_manager.has_regions,
+#             "smooth": 1e-5,
+#             "ddp": self.is_ddp,
+#         }
+
+#         ce_kwargs = {
+#             "weight": None,
+#             "ignore_index": self.label_manager.ignore_label
+#             if self.label_manager.has_ignore_label
+#             else -100,
+#         }
+
+#         loss = DC_and_CE_loss(
+#             soft_dice_kwargs,
+#             ce_kwargs,
+#             weight_ce=3,
+#             weight_dice=1,
+#             ignore_label=None,
+#         )
+
+#         # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
+#         # this gives higher resolution outputs more weight in the loss
+#         if self.enable_deep_supervision:
+#             deep_supervision_scales = self._get_deep_supervision_scales()
+#             weights = np.array(
+#                 [1 / (2**i) for i in range(len(deep_supervision_scales))]
+#             )
+#             weights[-1] = 0
+
+#             # we don't use the lowest 2 outputs. Normalize weights so that they sum to 1
+#             weights = weights / weights.sum()
+#             # now wrap the loss
+#             loss = DeepSupervisionWrapper(loss, weights)
+#         return loss
